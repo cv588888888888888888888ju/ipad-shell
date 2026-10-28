@@ -12,3 +12,4 @@ Payload/
 
 # macOS
 .DS_Store
+dist/
