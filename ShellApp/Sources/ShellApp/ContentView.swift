@@ -50,7 +50,7 @@ final class CanvasBridge {
     private var lastBackground: BackgroundMsg?
     private var hostBuffer = Data()
 
-    /// Messages arriving from the host (computer side): commands and page images.
+    /// Messages arriving from the host: commands and page images.
     var onHostMessage: (([String: Any]) -> Void)?
 
     func configure(size: CGSize) {
@@ -79,7 +79,7 @@ final class CanvasBridge {
                 self.listener = l
                 NSLog("canvas bridge listening on :8080")
             } catch {
-                NSLog("canvas bridge failed: \(error)")
+                NSLog("canvas bridge failed: \\(error)")
             }
         }
     }
@@ -121,7 +121,7 @@ final class CanvasBridge {
                 self.queue.async { self.consumeHostBytes(data) }
             }
             if let error {
-                NSLog("host read error: \(error)")
+                NSLog("host read error: \\(error)")
                 return
             }
             if isDone { return }
@@ -244,30 +244,18 @@ enum BackgroundRenderer {
     }
 }
 
-// MARK: - Canvas model shared by the toolbar and the canvas
+// MARK: - Single owner of the one live canvas
+//
+// Deliberately a plain singleton instead of an ObservableObject parameter: the
+// pen stopped rendering once the canvas was created through a SwiftUI property
+// wrapper, so the canvas now follows the v0.1 code path exactly.
 
 @MainActor
-final class CanvasModel: ObservableObject {
-    enum ToolKind: String, CaseIterable {
-        case pen, eraser, lasso
-    }
-
-    @Published var tool: ToolKind = .pen { didSet { apply() } }
-    @Published var color: UIColor = .black { didSet { apply() } }
-    @Published var width: Double = 4 { didSet { apply() } }
-    @Published var backgroundImage: UIImage?
-    @Published var strokeCount = 0
-    @Published var canvasSize = CGSize.zero
-    @Published var drawingBounds = CGRect.zero
-
+final class CanvasHub {
+    static let shared = CanvasHub()
     weak var canvas: PKCanvasView?
 
-    func attach(_ c: PKCanvasView) {
-        canvas = c
-        apply()
-    }
-
-    func apply() {
+    func apply(tool: CanvasModel.ToolKind, color: UIColor, width: Double) {
         guard let canvas else { return }
         switch tool {
         case .pen:
@@ -281,43 +269,49 @@ final class CanvasModel: ObservableObject {
 
     func undo() { canvas?.undoManager?.undo() }
     func redo() { canvas?.undoManager?.redo() }
+    func clear() { canvas?.drawing = PKDrawing() }
 
-    func clearDrawing() {
-        canvas?.drawing = PKDrawing()
-    }
-
-    /// Host-supplied page image. The canvas stays opaque (transparent PencilKit
-    /// layers stopped rendering ink), so the page becomes the canvas background.
+    /// Host-supplied page image. The canvas stays opaque (a transparent
+    /// PencilKit layer rendered no ink), so the page becomes its background.
     func setBackground(_ image: UIImage) {
-        guard let canvas, canvas.bounds.width > 0 else {
-            backgroundImage = image
-            return
-        }
+        guard let canvas, canvas.bounds.width > 0 else { return }
         let fitted = BackgroundRenderer.fit(image: image, into: canvas.bounds.size)
-        backgroundImage = fitted
         canvas.backgroundColor = UIColor(patternImage: fitted)
     }
 }
 
-// MARK: - Canvas delegate
+// MARK: - Toolbar state only; it never owns or wraps the canvas
 
 @MainActor
-final class CanvasCoordinator: NSObject, PKCanvasViewDelegate {
-    weak var model: CanvasModel?
-
-    init(model: CanvasModel) {
-        self.model = model
+final class CanvasModel: ObservableObject {
+    enum ToolKind: String, CaseIterable {
+        case pen, eraser, lasso
     }
 
+    @Published var tool: ToolKind = .pen {
+        didSet { CanvasHub.shared.apply(tool: tool, color: color, width: width) }
+    }
+    @Published var color: UIColor = .black {
+        didSet { CanvasHub.shared.apply(tool: tool, color: color, width: width) }
+    }
+    @Published var width: Double = 4 {
+        didSet { CanvasHub.shared.apply(tool: tool, color: color, width: width) }
+    }
+
+    func undo() { CanvasHub.shared.undo() }
+    func redo() { CanvasHub.shared.redo() }
+    func clearDrawing() { CanvasHub.shared.clear() }
+}
+
+// MARK: - Canvas delegate
+
+final class CanvasCoordinator: NSObject, PKCanvasViewDelegate {
     private var sentCount = 0
     private var lastPointCount = -1
     private var lastSend = Date.distantPast
 
     func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
         let strokes = canvasView.drawing.strokes
-        model?.strokeCount = strokes.count
-        model?.drawingBounds = canvasView.drawing.bounds
-        model?.canvasSize = canvasView.bounds.size
         let now = Date()
         defer {
             sentCount = strokes.count
@@ -350,40 +344,36 @@ final class CanvasCoordinator: NSObject, PKCanvasViewDelegate {
 
 // MARK: - Views
 
+/// Exactly the v0.1 shape: no parameters, no wrapper, no property observers.
 struct PencilCanvas: UIViewRepresentable {
-    @ObservedObject var model: CanvasModel
-
-    func makeCoordinator() -> CanvasCoordinator { CanvasCoordinator(model: model) }
+    func makeCoordinator() -> CanvasCoordinator { CanvasCoordinator() }
 
     func makeUIView(context: Context) -> PKCanvasView {
         let canvas = PKCanvasView()
         canvas.drawingPolicy = .anyInput
+        canvas.tool = PKInkingTool(.pen, color: .black, width: 4)
         canvas.backgroundColor = .white
         canvas.isOpaque = true
-        canvas.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         canvas.delegate = context.coordinator
-        // Belt and braces: set a working pen immediately, before the model loads.
-        canvas.tool = PKInkingTool(.pen, color: .black, width: 4)
-        model.attach(canvas)
-        NSLog("canvas makeUIView bounds=\(canvas.bounds) tool=\(String(describing: canvas.tool))")
+        CanvasHub.shared.canvas = canvas
+
         DispatchQueue.main.async {
             CanvasBridge.shared.configure(size: canvas.bounds.size)
             CanvasBridge.shared.start()
-            CanvasBridge.shared.onHostMessage = { [weak model] msg in
-                guard let model else { return }
+            CanvasBridge.shared.onHostMessage = { msg in
                 guard let type = msg["type"] as? String else { return }
                 if type == "background" {
                     if let b64 = msg["data"] as? String,
                        let data = Data(base64Encoded: b64),
                        let image = UIImage(data: data) {
-                        model.setBackground(image)
+                        CanvasHub.shared.setBackground(image)
                     }
                     return
                 }
                 switch type {
-                case "clear": model.clearDrawing()
-                case "undo": model.undo()
-                case "redo": model.redo()
+                case "clear": CanvasHub.shared.clear()
+                case "undo": CanvasHub.shared.undo()
+                case "redo": CanvasHub.shared.redo()
                 default: break
                 }
             }
@@ -393,40 +383,6 @@ struct PencilCanvas: UIViewRepresentable {
 
     func updateUIView(_ canvas: PKCanvasView, context: Context) {
         CanvasBridge.shared.configure(size: canvas.bounds.size)
-        if canvas.bounds.size != model.canvasSize {
-            DispatchQueue.main.async { [weak model] in
-                model?.canvasSize = canvas.bounds.size
-            }
-        }
-        // PencilKit builds its content layer lazily; force a layout pass in case
-        // the canvas was first laid out at zero size.
-        if canvas.bounds.size.width > 0 {
-            canvas.setNeedsLayout()
-            canvas.layoutIfNeeded()
-        }
-    }
-}
-
-/// Fallback display: rasterise the PKDrawing ourselves. If PKCanvasView's
-/// content layer is the thing that is broken, this proves it and keeps us usable.
-struct InkPreview: UIViewRepresentable {
-    @ObservedObject var model: CanvasModel
-
-    func makeUIView(context: Context) -> UIImageView {
-        let v = UIImageView()
-        v.contentMode = .scaleAspectFill
-        v.isUserInteractionEnabled = false
-        v.backgroundColor = .clear
-        return v
-    }
-
-    func updateUIView(_ v: UIImageView, context: Context) {
-        guard let canvas = model.canvas, canvas.bounds.width > 0 else { return }
-        guard !canvas.drawing.strokes.isEmpty else {
-            v.image = nil
-            return
-        }
-        v.image = canvas.drawing.image(from: canvas.bounds, scale: 2)
     }
 }
 
@@ -484,21 +440,11 @@ struct ContentView: View {
     @StateObject private var model = CanvasModel()
 
     var body: some View {
-        PencilCanvas(model: model)
+        PencilCanvas()
             .ignoresSafeArea()
-            .overlay { InkPreview(model: model).ignoresSafeArea() }
             .overlay(alignment: .top) {
                 Toolbar(model: model)
                     .padding(.top, 10)
-            }
-            .overlay(alignment: .bottomLeading) {
-                Text("\(Int(model.canvasSize.width))×\(Int(model.canvasSize.height))  strokes \(model.strokeCount)  ink \(Int(model.drawingBounds.width))×\(Int(model.drawingBounds.height))")
-                    .font(.caption.monospaced())
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(.ultraThinMaterial, in: Capsule())
-                    .padding(.leading, 12)
-                    .padding(.bottom, 12)
             }
     }
 }
