@@ -283,13 +283,16 @@ final class CanvasModel: ObservableObject {
         canvas?.drawing = PKDrawing()
     }
 
-    /// Host-supplied page image, fitted to the current canvas so ink lines up.
+    /// Host-supplied page image. The canvas stays opaque (transparent PencilKit
+    /// layers stopped rendering ink), so the page becomes the canvas background.
     func setBackground(_ image: UIImage) {
         guard let canvas, canvas.bounds.width > 0 else {
             backgroundImage = image
             return
         }
-        backgroundImage = BackgroundRenderer.fit(image: image, into: canvas.bounds.size)
+        let fitted = BackgroundRenderer.fit(image: image, into: canvas.bounds.size)
+        backgroundImage = fitted
+        canvas.backgroundColor = UIColor(patternImage: fitted)
     }
 }
 
@@ -343,8 +346,8 @@ struct PencilCanvas: UIViewRepresentable {
         let canvas = PKCanvasView()
         canvas.drawingPolicy = .anyInput
         canvas.isScrollEnabled = false
-        canvas.backgroundColor = .clear
-        canvas.isOpaque = false
+        canvas.backgroundColor = .white
+        canvas.isOpaque = true
         canvas.isUserInteractionEnabled = true
         canvas.delegate = context.coordinator
         // Belt and braces: set a working pen immediately, before the model loads.
