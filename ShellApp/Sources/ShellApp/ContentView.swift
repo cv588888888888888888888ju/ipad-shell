@@ -257,6 +257,8 @@ final class CanvasModel: ObservableObject {
     @Published var width: Double = 4 { didSet { apply() } }
     @Published var backgroundImage: UIImage?
     @Published var strokeCount = 0
+    @Published var canvasSize = CGSize.zero
+    @Published var drawingBounds = CGRect.zero
 
     weak var canvas: PKCanvasView?
 
@@ -314,6 +316,8 @@ final class CanvasCoordinator: NSObject, PKCanvasViewDelegate {
     func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
         let strokes = canvasView.drawing.strokes
         model?.strokeCount = strokes.count
+        model?.drawingBounds = canvasView.drawing.bounds
+        model?.canvasSize = canvasView.bounds.size
         let now = Date()
         defer {
             sentCount = strokes.count
@@ -356,6 +360,7 @@ struct PencilCanvas: UIViewRepresentable {
         canvas.drawingPolicy = .anyInput
         canvas.backgroundColor = .white
         canvas.isOpaque = true
+        canvas.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         canvas.delegate = context.coordinator
         // Belt and braces: set a working pen immediately, before the model loads.
         canvas.tool = PKInkingTool(.pen, color: .black, width: 4)
@@ -388,6 +393,17 @@ struct PencilCanvas: UIViewRepresentable {
 
     func updateUIView(_ canvas: PKCanvasView, context: Context) {
         CanvasBridge.shared.configure(size: canvas.bounds.size)
+        if canvas.bounds.size != model.canvasSize {
+            DispatchQueue.main.async { [weak model] in
+                model?.canvasSize = canvas.bounds.size
+            }
+        }
+        // PencilKit builds its content layer lazily; force a layout pass in case
+        // the canvas was first laid out at zero size.
+        if canvas.bounds.size.width > 0 {
+            canvas.setNeedsLayout()
+            canvas.layoutIfNeeded()
+        }
     }
 }
 
@@ -452,7 +468,7 @@ struct ContentView: View {
                     .padding(.top, 10)
             }
             .overlay(alignment: .bottomLeading) {
-                Text("strokes \(model.strokeCount)")
+                Text("\(Int(model.canvasSize.width))×\(Int(model.canvasSize.height))  strokes \(model.strokeCount)  ink \(Int(model.drawingBounds.width))×\(Int(model.drawingBounds.height))")
                     .font(.caption.monospaced())
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
