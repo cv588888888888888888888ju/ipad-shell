@@ -62,7 +62,7 @@ final class CanvasBridge {
     }
 
     func stroke(_ s: PKStroke, index: Int) {
-        let msg = StrokeMsg(type: "stroke", index: index,
+        let msg = StrokeMsg(index: index,
                             color: Self.hex(s.ink.color),
                             width: Self.width(s),
                             pts: Self.points(s))
