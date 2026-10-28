@@ -138,6 +138,14 @@ struct ContentView: View {
         #if os(iOS)
         PencilCanvas()
             .ignoresSafeArea()
+            .overlay(alignment: .top) {
+                Text("toolbar?")
+                    .font(.caption)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .padding(.top, 10)
+            }
         #else
         Text("iOS only")
         #endif
