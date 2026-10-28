@@ -111,14 +111,14 @@ final class CanvasBridge {
             let p = s.path[i]
             out.append([
                 Double(p.location.x), Double(p.location.y),
-                Double(p.force), Double(p.size), Double(p.timeOffset),
+                Double(p.force), Double(p.size.width), Double(p.timeOffset),
             ])
         }
         return out
     }
 
     private static func width(_ s: PKStroke) -> Double {
-        s.path.count > 0 ? Double(s.path[0].size) : 4.0
+        s.path.count > 0 ? Double(s.path[0].size.width) : 4.0
     }
 
     private static func hex(_ c: UIColor) -> String {
