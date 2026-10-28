@@ -323,10 +323,20 @@ def main() -> int:
     threading.Thread(target=web.serve_forever, daemon=True).start()
     print(f"open http://127.0.0.1:{args.web_port}/ in a browser", file=sys.stderr, flush=True)
 
-    dev_id, sock = live_view.wait_for_device(args.device_id, args.device_port)
-    print(f"attached to device {dev_id} port {args.device_port}", file=sys.stderr, flush=True)
-    live_view.pump_device(sock)
-    return 0
+    while True:
+        dev_id, sock = live_view.wait_for_device(args.device_id, args.device_port)
+        print(f"attached to device {dev_id} port {args.device_port}", file=sys.stderr, flush=True)
+        try:
+            live_view.pump_device(sock)
+        except KeyboardInterrupt:
+            return 0
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        print("device dropped; waiting for it to come back", file=sys.stderr, flush=True)
+        time.sleep(1)
 
 
 if __name__ == "__main__":

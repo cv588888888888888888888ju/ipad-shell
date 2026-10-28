@@ -256,6 +256,7 @@ final class CanvasModel: ObservableObject {
     @Published var color: UIColor = .black { didSet { apply() } }
     @Published var width: Double = 4 { didSet { apply() } }
     @Published var backgroundImage: UIImage?
+    @Published var strokeCount = 0
 
     weak var canvas: PKCanvasView?
 
@@ -298,13 +299,21 @@ final class CanvasModel: ObservableObject {
 
 // MARK: - Canvas delegate
 
+@MainActor
 final class CanvasCoordinator: NSObject, PKCanvasViewDelegate {
+    weak var model: CanvasModel?
+
+    init(model: CanvasModel) {
+        self.model = model
+    }
+
     private var sentCount = 0
     private var lastPointCount = -1
     private var lastSend = Date.distantPast
 
     func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
         let strokes = canvasView.drawing.strokes
+        model?.strokeCount = strokes.count
         let now = Date()
         defer {
             sentCount = strokes.count
@@ -340,7 +349,7 @@ final class CanvasCoordinator: NSObject, PKCanvasViewDelegate {
 struct PencilCanvas: UIViewRepresentable {
     @ObservedObject var model: CanvasModel
 
-    func makeCoordinator() -> CanvasCoordinator { CanvasCoordinator() }
+    func makeCoordinator() -> CanvasCoordinator { CanvasCoordinator(model: model) }
 
     func makeUIView(context: Context) -> PKCanvasView {
         let canvas = PKCanvasView()
@@ -451,6 +460,15 @@ struct ContentView: View {
         .overlay(alignment: .top) {
             Toolbar(model: model)
                 .padding(.top, 10)
+        }
+        .overlay(alignment: .bottomLeading) {
+            Text("strokes \(model.strokeCount)")
+                .font(.caption.monospaced())
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(.ultraThinMaterial, in: Capsule())
+                .padding(.leading, 12)
+                .padding(.bottom, 12)
         }
     }
 }
