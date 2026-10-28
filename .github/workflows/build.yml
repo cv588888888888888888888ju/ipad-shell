@@ -22,6 +22,7 @@ jobs:
       - name: Build unsigned
         working-directory: ShellApp
         run: |
+          set -o pipefail
           xcodebuild \
             -project ShellApp.xcodeproj \
             -scheme ShellApp \
@@ -31,17 +32,22 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            build | tail -30
+            build 2>&1 | grep -E "error:|warning: .*deprecated|BUILD|\.app$" | tail -40
 
       - name: Package unsigned ipa
         working-directory: ShellApp
         run: |
+          set -euo pipefail
           APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
           echo "app=$APP"
           test -n "$APP"
+          ls -la "$APP"
+          test -f "$APP/ShellApp" || { echo "FATAL: app binary missing"; exit 1; }
+          rm -rf Payload ShellApp-unsigned.ipa
           mkdir -p Payload
-          cp -R "$APP" Payload/
+          ditto "$APP" "Payload/$(basename "$APP")"
           zip -qry ShellApp-unsigned.ipa Payload
+          unzip -l ShellApp-unsigned.ipa
 
       - uses: actions/upload-artifact@v4
         with:
