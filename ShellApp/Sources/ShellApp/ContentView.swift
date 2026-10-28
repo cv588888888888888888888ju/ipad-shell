@@ -407,6 +407,29 @@ struct PencilCanvas: UIViewRepresentable {
     }
 }
 
+/// Fallback display: rasterise the PKDrawing ourselves. If PKCanvasView's
+/// content layer is the thing that is broken, this proves it and keeps us usable.
+struct InkPreview: UIViewRepresentable {
+    @ObservedObject var model: CanvasModel
+
+    func makeUIView(context: Context) -> UIImageView {
+        let v = UIImageView()
+        v.contentMode = .scaleAspectFill
+        v.isUserInteractionEnabled = false
+        v.backgroundColor = .clear
+        return v
+    }
+
+    func updateUIView(_ v: UIImageView, context: Context) {
+        guard let canvas = model.canvas, canvas.bounds.width > 0 else { return }
+        guard !canvas.drawing.strokes.isEmpty else {
+            v.image = nil
+            return
+        }
+        v.image = canvas.drawing.image(from: canvas.bounds, scale: 2)
+    }
+}
+
 struct Toolbar: View {
     @ObservedObject var model: CanvasModel
 
@@ -463,6 +486,7 @@ struct ContentView: View {
     var body: some View {
         PencilCanvas(model: model)
             .ignoresSafeArea()
+            .overlay { InkPreview(model: model).ignoresSafeArea() }
             .overlay(alignment: .top) {
                 Toolbar(model: model)
                     .padding(.top, 10)
