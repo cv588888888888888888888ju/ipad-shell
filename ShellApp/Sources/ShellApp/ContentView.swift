@@ -342,10 +342,15 @@ struct PencilCanvas: UIViewRepresentable {
     func makeUIView(context: Context) -> PKCanvasView {
         let canvas = PKCanvasView()
         canvas.drawingPolicy = .anyInput
+        canvas.isScrollEnabled = false
         canvas.backgroundColor = .clear
         canvas.isOpaque = false
+        canvas.isUserInteractionEnabled = true
         canvas.delegate = context.coordinator
+        // Belt and braces: set a working pen immediately, before the model loads.
+        canvas.tool = PKInkingTool(.pen, color: .black, width: 4)
         model.attach(canvas)
+        NSLog("canvas makeUIView bounds=\(canvas.bounds) tool=\(String(describing: canvas.tool))")
         DispatchQueue.main.async {
             CanvasBridge.shared.configure(size: canvas.bounds.size)
             CanvasBridge.shared.start()
