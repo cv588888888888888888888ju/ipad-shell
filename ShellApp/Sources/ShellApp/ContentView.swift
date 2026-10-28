@@ -354,10 +354,8 @@ struct PencilCanvas: UIViewRepresentable {
     func makeUIView(context: Context) -> PKCanvasView {
         let canvas = PKCanvasView()
         canvas.drawingPolicy = .anyInput
-        canvas.isScrollEnabled = false
         canvas.backgroundColor = .white
         canvas.isOpaque = true
-        canvas.isUserInteractionEnabled = true
         canvas.delegate = context.coordinator
         // Belt and braces: set a working pen immediately, before the model loads.
         canvas.tool = PKInkingTool(.pen, color: .black, width: 4)
@@ -447,29 +445,21 @@ struct ContentView: View {
     @StateObject private var model = CanvasModel()
 
     var body: some View {
-        ZStack {
-            Color.white
-            if let bg = model.backgroundImage {
-                Image(uiImage: bg)
-                    .resizable()
-                    .ignoresSafeArea()
+        PencilCanvas(model: model)
+            .ignoresSafeArea()
+            .overlay(alignment: .top) {
+                Toolbar(model: model)
+                    .padding(.top, 10)
             }
-            PencilCanvas(model: model)
-                .ignoresSafeArea()
-        }
-        .overlay(alignment: .top) {
-            Toolbar(model: model)
-                .padding(.top, 10)
-        }
-        .overlay(alignment: .bottomLeading) {
-            Text("strokes \(model.strokeCount)")
-                .font(.caption.monospaced())
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(.ultraThinMaterial, in: Capsule())
-                .padding(.leading, 12)
-                .padding(.bottom, 12)
-        }
+            .overlay(alignment: .bottomLeading) {
+                Text("strokes \(model.strokeCount)")
+                    .font(.caption.monospaced())
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .padding(.leading, 12)
+                    .padding(.bottom, 12)
+            }
     }
 }
 #endif
