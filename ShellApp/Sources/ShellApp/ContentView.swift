@@ -48,9 +48,10 @@ final class CanvasBridge {
     private var conns: [NWConnection] = []
     private var canvasSize = CGSize.zero
     private var lastBackground: BackgroundMsg?
+    private var hostBuffer = Data()
 
-    /// Commands arriving from the host (computer side), e.g. clear / undo.
-    var onHostCommand: ((String) -> Void)?
+    /// Messages arriving from the host (computer side): commands and page images.
+    var onHostMessage: (([String: Any]) -> Void)?
 
     func configure(size: CGSize) {
         canvasSize = size
@@ -114,14 +115,10 @@ final class CanvasBridge {
     }
 
     private func receive(on conn: NWConnection) {
-        conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isDone, error in
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 1_048_576) { [weak self] data, _, isDone, error in
             guard let self else { return }
             if let data, !data.isEmpty {
-                if let line = String(data: data, encoding: .utf8),
-                   let json = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
-                   let type = json["type"] as? String {
-                    DispatchQueue.main.async { self.onHostCommand?(type) }
-                }
+                self.queue.async { self.consumeHostBytes(data) }
             }
             if let error {
                 NSLog("host read error: \(error)")
@@ -129,6 +126,18 @@ final class CanvasBridge {
             }
             if isDone { return }
             self.receive(on: conn)
+        }
+    }
+
+    /// Host lines are newline-delimited; page images arrive in many chunks.
+    private func consumeHostBytes(_ data: Data) {
+        hostBuffer.append(data)
+        while let nl = hostBuffer.firstIndex(of: 0x0A) {
+            let line = hostBuffer[hostBuffer.startIndex..<nl]
+            hostBuffer = hostBuffer[(nl + 1)...]
+            guard !line.isEmpty,
+                  let json = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else { continue }
+            DispatchQueue.main.async { self.onHostMessage?(json) }
         }
     }
 
@@ -246,6 +255,7 @@ final class CanvasModel: ObservableObject {
     @Published var tool: ToolKind = .pen { didSet { apply() } }
     @Published var color: UIColor = .black { didSet { apply() } }
     @Published var width: Double = 4 { didSet { apply() } }
+    @Published var backgroundImage: UIImage?
 
     weak var canvas: PKCanvasView?
 
@@ -271,6 +281,15 @@ final class CanvasModel: ObservableObject {
 
     func clearDrawing() {
         canvas?.drawing = PKDrawing()
+    }
+
+    /// Host-supplied page image, fitted to the current canvas so ink lines up.
+    func setBackground(_ image: UIImage) {
+        guard let canvas, canvas.bounds.width > 0 else {
+            backgroundImage = image
+            return
+        }
+        backgroundImage = BackgroundRenderer.fit(image: image, into: canvas.bounds.size)
     }
 }
 
@@ -330,9 +349,18 @@ struct PencilCanvas: UIViewRepresentable {
         DispatchQueue.main.async {
             CanvasBridge.shared.configure(size: canvas.bounds.size)
             CanvasBridge.shared.start()
-            CanvasBridge.shared.onHostCommand = { [weak model] cmd in
+            CanvasBridge.shared.onHostMessage = { [weak model] msg in
                 guard let model else { return }
-                switch cmd {
+                guard let type = msg["type"] as? String else { return }
+                if type == "background" {
+                    if let b64 = msg["data"] as? String,
+                       let data = Data(base64Encoded: b64),
+                       let image = UIImage(data: data) {
+                        model.setBackground(image)
+                    }
+                    return
+                }
+                switch type {
                 case "clear": model.clearDrawing()
                 case "undo": model.undo()
                 case "redo": model.redo()
@@ -350,7 +378,6 @@ struct PencilCanvas: UIViewRepresentable {
 
 struct Toolbar: View {
     @ObservedObject var model: CanvasModel
-    var onImport: () -> Void
 
     var body: some View {
         HStack(spacing: 8) {
@@ -383,10 +410,6 @@ struct Toolbar: View {
 
             Button { model.undo() } label: { Image(systemName: "arrow.uturn.backward") }
             Button { model.redo() } label: { Image(systemName: "arrow.uturn.forward") }
-
-            Divider().frame(height: 24)
-
-            Button { onImport() } label: { Image(systemName: "photo.on.rectangle") }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
@@ -405,13 +428,11 @@ struct Toolbar: View {
 
 struct ContentView: View {
     @StateObject private var model = CanvasModel()
-    @State private var background: UIImage?
-    @State private var importing = false
 
     var body: some View {
         ZStack {
             Color.white
-            if let bg = background {
+            if let bg = model.backgroundImage {
                 Image(uiImage: bg)
                     .resizable()
                     .ignoresSafeArea()
@@ -420,20 +441,8 @@ struct ContentView: View {
                 .ignoresSafeArea()
         }
         .overlay(alignment: .top) {
-            Toolbar(model: model, onImport: { importing = true })
+            Toolbar(model: model)
                 .padding(.top, 10)
-        }
-        .fileImporter(
-            isPresented: $importing,
-            allowedContentTypes: [.pdf, .image],
-            allowsMultipleSelection: false
-        ) { result in
-            guard case .success(let urls) = result, let url = urls.first else { return }
-            let size = UIScreen.main.bounds.size
-            if let rendered = BackgroundRenderer.render(url: url, canvasSize: size) {
-                background = rendered
-                CanvasBridge.shared.background(rendered)
-            }
         }
     }
 }

@@ -161,6 +161,33 @@ PAGE = r"""<!doctype html>
     }
   }
 
+  var sentFiles = Object.create(null);
+
+  function pushBackground(dataURL) {
+    var img = new Image();
+    img.onload = function () {
+      var c = document.createElement('canvas');
+      c.width = W; c.height = H;
+      var g = c.getContext('2d');
+      g.fillStyle = '#fff';
+      g.fillRect(0, 0, W, H);
+      var sc = Math.min(W / img.width, H / img.height);
+      var dw = img.width * sc, dh = img.height * sc;
+      g.drawImage(img, (W - dw) / 2, (H - dh) / 2, dw, dh);
+      var out = c.toDataURL('image/jpeg', 0.85);
+      var b64 = out.split(',')[1];
+      hud.textContent = 'pushing page to ipad…';
+      fetch('/background', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'background', mime: 'image/jpeg', w: W, h: H, data: b64 })
+      }).then(function (r) {
+        hud.textContent = r.ok ? 'page sent to ipad' : 'ipad not attached';
+      }).catch(function () { hud.textContent = 'push failed'; });
+    };
+    img.src = dataURL;
+  }
+
   function App() {
     return React.createElement(Excalidraw, {
       excalidrawAPI: function (a) {
@@ -168,6 +195,17 @@ PAGE = r"""<!doctype html>
         hud.textContent = 'excalidraw ready';
         if (bgElement) api.addFiles([bgFile]);
         schedule();
+      },
+      onChange: function (elements, appState, files) {
+        if (!files) return;
+        for (var i = 0; i < elements.length; i++) {
+          var el = elements[i];
+          if (el.type !== 'image' || !el.fileId || el.isDeleted) continue;
+          var f = files[el.fileId];
+          if (!f || !f.dataURL || sentFiles[el.fileId]) continue;
+          sentFiles[el.fileId] = true;
+          pushBackground(f.dataURL);
+        }
       },
       initialData: { appState: { viewBackgroundColor: '#ffffff' } }
     });
@@ -205,6 +243,32 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt: str, *args: object) -> None:
         pass
+
+    def do_POST(self) -> None:  # noqa: N802
+        if self.path != "/background":
+            self.send_error(404)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self.send_error(400)
+            return
+        raw = self.rfile.read(length)
+        try:
+            msg = json.loads(raw)
+        except Exception:
+            self.send_error(400)
+            return
+        if msg.get("type") != "background" or not isinstance(msg.get("data"), str):
+            self.send_error(400)
+            return
+        ok = live_view.send_to_device(msg)
+        self.send_response(200 if ok else 503)
+        self.send_header("Content-Type", "application/json")
+        body = b'{"ok":true}' if ok else b'{"ok":false}'
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/":

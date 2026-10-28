@@ -26,6 +26,9 @@ CLIENT_NAME = "ipad-canvas-view"
 clients: set[Queue[str]] = set()
 clients_lock = threading.Lock()
 
+device_sock: socket.socket | None = None
+device_lock = threading.Lock()
+
 
 def log(*args: object) -> None:
     print(*args, file=sys.stderr, flush=True)
@@ -116,6 +119,9 @@ def broadcast(line: str) -> None:
 
 
 def pump_device(sock: socket.socket) -> None:
+    global device_sock
+    with device_lock:
+        device_sock = sock
     log("device connected; streaming")
     buffer = b""
     while True:
@@ -133,6 +139,21 @@ def pump_device(sock: socket.socket) -> None:
             raw = raw.strip()
             if raw:
                 broadcast(raw.decode("utf-8", "replace"))
+
+
+def send_to_device(msg: dict) -> bool:
+    """Push one JSON line to the iPad over the USB tunnel."""
+    with device_lock:
+        sock = device_sock
+    if sock is None:
+        log("no device attached; dropping", msg.get("type"))
+        return False
+    try:
+        sock.sendall((json.dumps(msg, separators=(",", ":")) + "\n").encode("utf-8"))
+        return True
+    except OSError as exc:
+        log("device write error:", exc)
+        return False
 
 
 # --------------------------------------------------------------------------
