@@ -42,7 +42,6 @@ def _save_last_background(msg: dict) -> None:
 
 last_background: dict | None = _load_last_background()
 LAST_PAGE_FILE = pathlib.Path(__file__).resolve().parent.parent / ".last-page.json"
-last_page: dict | None = _load_last_page()
 
 
 def _save_last_page(msg: dict) -> None:
@@ -57,6 +56,9 @@ def _load_last_page() -> dict | None:
         return json.loads(LAST_PAGE_FILE.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+
+last_page: dict | None = _load_last_page()
 
 PAGE = r"""<!doctype html>
 <html lang="zh">
@@ -265,6 +267,27 @@ PAGE = r"""<!doctype html>
     }, 400);
   }
 
+  // The iPad slid the page: shift this viewport by the same delta so the two
+  // screens stay on the same window. The sign flips because sliding content to
+  // the right is a negative scroll.
+  var vpPending = {dx: 0, dy: 0};
+  var vpTimer = null;
+  function applyViewport(m) {
+    vpPending.dx += m.dx || 0;
+    vpPending.dy += m.dy || 0;
+    if (vpTimer) return;
+    vpTimer = setTimeout(function () {
+      vpTimer = null;
+      var dx = vpPending.dx, dy = vpPending.dy;
+      vpPending = {dx: 0, dy: 0};
+      if (!dx && !dy) return;
+      try {
+        var st = api.getAppState();
+        api.updateScene({ appState: { scrollX: st.scrollX - dx, scrollY: st.scrollY - dy } });
+      } catch (e) { console.warn(e); }
+    }, 16);
+  }
+
   // An image element was dragged/pinched on the iPad: adopt its new rect here
   // so both sides agree without a round trip back to the device.
   function applyImageRect(m) {
@@ -395,6 +418,9 @@ PAGE = r"""<!doctype html>
       setBackground(m);
     } else if (m.type === 'imageRect') {
       applyImageRect(m);
+      return;
+    } else if (m.type === 'viewport') {
+      applyViewport(m);
       return;
     }
     schedule();

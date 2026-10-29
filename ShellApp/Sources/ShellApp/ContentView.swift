@@ -99,6 +99,19 @@ final class CanvasBridge {
         }
     }
 
+    func viewport(dx: Double, dy: Double) {
+        let msg: [String: Any] = ["type": "viewport", "dx": dx, "dy": dy]
+        guard let d = try? JSONSerialization.data(withJSONObject: msg),
+              let line = String(data: d, encoding: .utf8) else { return }
+        let payload = (line + "\n").data(using: .utf8) ?? Data()
+        queue.async { [weak self] in
+            guard let self else { return }
+            for c in self.conns {
+                c.send(content: payload, completion: .contentProcessed { _ in })
+            }
+        }
+    }
+
     func reset() {
         let payload = "{\"type\":\"reset\"}\n".data(using: .utf8) ?? Data()
         queue.async { [weak self] in
@@ -160,24 +173,48 @@ final class CanvasCoordinator: NSObject, PKCanvasViewDelegate, UIGestureRecogniz
     private var lastPointCount = -1
     private var lastSend = Date.distantPast
 
-    @objc func handleBackgroundPan(_ g: UIPanGestureRecognizer) {
-        guard let view = CanvasHub.shared.activePageView else { return }
+    fileprivate var imageDrag: UIPanGestureRecognizer?
+
+    /// Tap an image to take hold of it; tap empty canvas to let go.
+    @objc func handleTap(_ g: UITapGestureRecognizer) {
+        guard let canvas = CanvasHub.shared.canvas else { return }
+        let point = g.location(in: canvas)
+        if let id = CanvasHub.shared.imageId(at: point) {
+            CanvasHub.shared.select(id)
+            imageDrag?.isEnabled = true
+            canvas.drawingPolicy = .pencilOnly
+        } else {
+            CanvasHub.shared.select(nil)
+            imageDrag?.isEnabled = false
+            canvas.drawingPolicy = .anyInput
+        }
+    }
+
+    /// One finger moves only the selected image, so the rest of the page stays put.
+    @objc func handleImageDrag(_ g: UIPanGestureRecognizer) {
+        guard let id = CanvasHub.shared.selectedId,
+              let view = CanvasHub.shared.pageViews[id] else { return }
         let t = g.translation(in: g.view)
         view.center = CGPoint(x: view.center.x + t.x, y: view.center.y + t.y)
         g.setTranslation(.zero, in: g.view)
         if g.state == .ended { CanvasHub.shared.reportActiveRect() }
     }
 
+    /// Two fingers slide the whole page under the ink, and the host viewport
+    /// follows the same delta so both screens show the same window.
+    @objc func handleBackgroundPan(_ g: UIPanGestureRecognizer) {
+        let t = g.translation(in: g.view)
+        CanvasHub.shared.moveAll(by: t)
+        g.setTranslation(.zero, in: g.view)
+        CanvasBridge.shared.viewport(dx: Double(t.x), dy: Double(t.y))
+    }
+
+    /// Two-finger pinch scales every image around the canvas centre.
     @objc func handleBackgroundPinch(_ g: UIPinchGestureRecognizer) {
-        guard let view = CanvasHub.shared.activePageView else { return }
-        let w = view.bounds.width * g.scale
-        let h = view.bounds.height * g.scale
+        let s = g.scale
         g.scale = 1
-        guard w > 20, h > 20, w < 8000, h < 8000 else { return }
-        let center = view.center
-        view.bounds = CGRect(x: 0, y: 0, width: w, height: h)
-        view.center = center
-        if g.state == .ended { CanvasHub.shared.reportActiveRect() }
+        CanvasHub.shared.scaleAll(by: s)
+        if g.state == .ended { CanvasHub.shared.reportAllRects() }
     }
 
     func gestureRecognizer(_ g: UIGestureRecognizer,
@@ -238,6 +275,19 @@ struct PencilCanvas: UIViewRepresentable {
                                              action: #selector(CanvasCoordinator.handleBackgroundPinch(_:)))
         pinch.delegate = context.coordinator
         canvas.addGestureRecognizer(pinch)
+
+        let tap = UITapGestureRecognizer(target: context.coordinator,
+                                         action: #selector(CanvasCoordinator.handleTap(_:)))
+        tap.delegate = context.coordinator
+        canvas.addGestureRecognizer(tap)
+
+        let drag = UIPanGestureRecognizer(target: context.coordinator,
+                                          action: #selector(CanvasCoordinator.handleImageDrag(_:)))
+        drag.maximumNumberOfTouches = 1
+        drag.isEnabled = false
+        drag.delegate = context.coordinator
+        canvas.addGestureRecognizer(drag)
+        context.coordinator.imageDrag = drag
 
         DispatchQueue.main.async {
             CanvasBridge.shared.configure(size: canvas.bounds.size)
@@ -318,6 +368,53 @@ final class CanvasHub {
     fileprivate var activePageView: UIImageView? {
         guard let id = activeId else { return nil }
         return pageViews[id]
+    }
+
+    fileprivate var selectedId: String?
+
+    func imageId(at point: CGPoint) -> String? {
+        for (id, view) in pageViews where view.frame.contains(point) {
+            return id
+        }
+        return nil
+    }
+
+    func select(_ id: String?) {
+        selectedId = id
+        if let id { activeId = id }
+        for (key, view) in pageViews {
+            view.layer.borderWidth = (key == id) ? 2 : 0
+            view.layer.borderColor = UIColor.systemBlue.cgColor
+        }
+    }
+
+    func moveAll(by t: CGPoint) {
+        for view in pageViews.values {
+            view.center = CGPoint(x: view.center.x + t.x, y: view.center.y + t.y)
+        }
+    }
+
+    func scaleAll(by scale: CGFloat) {
+        guard let canvas else { return }
+        let anchor = CGPoint(x: canvas.bounds.midX, y: canvas.bounds.midY)
+        for view in pageViews.values {
+            let w = view.bounds.width * scale
+            let h = view.bounds.height * scale
+            guard w > 20, h > 20, w < 8000, h < 8000 else { continue }
+            let rel = CGPoint(x: (view.center.x - anchor.x) * scale,
+                              y: (view.center.y - anchor.y) * scale)
+            view.bounds = CGRect(x: 0, y: 0, width: w, height: h)
+            view.center = CGPoint(x: anchor.x + rel.x, y: anchor.y + rel.y)
+        }
+    }
+
+    func reportAllRects() {
+        for (id, view) in pageViews {
+            let f = view.frame
+            CanvasBridge.shared.imageRect(id: id,
+                                          x: Double(f.origin.x), y: Double(f.origin.y),
+                                          w: Double(f.size.width), h: Double(f.size.height))
+        }
     }
 
     func setPage(_ items: [[String: Any]]) {
