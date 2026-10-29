@@ -122,6 +122,7 @@ struct PencilCanvas: UIViewRepresentable {
         canvas.backgroundColor = .white
         canvas.isOpaque = true
         canvas.delegate = context.coordinator
+        CanvasHub.shared.canvas = canvas
         DispatchQueue.main.async {
             CanvasBridge.shared.configure(size: canvas.bounds.size)
             CanvasBridge.shared.start()
@@ -133,17 +134,97 @@ struct PencilCanvas: UIViewRepresentable {
 }
 #endif
 
+
+// MARK: - Bisect step 4: full toolbar wired through a singleton hub
+
+@MainActor
+final class CanvasHub {
+    static let shared = CanvasHub()
+    weak var canvas: PKCanvasView?
+
+    func apply(tool: CanvasModel.ToolKind, color: UIColor, width: Double) {
+        guard let canvas else { return }
+        switch tool {
+        case .pen:
+            canvas.tool = PKInkingTool(.pen, color: color, width: CGFloat(width))
+        case .eraser:
+            canvas.tool = PKEraserTool(.vector)
+        case .lasso:
+            canvas.tool = PKLassoTool()
+        }
+    }
+
+    func undo() { canvas?.undoManager?.undo() }
+    func redo() { canvas?.undoManager?.redo() }
+}
+
+@MainActor
+final class CanvasModel: ObservableObject {
+    enum ToolKind: String, CaseIterable { case pen, eraser, lasso }
+
+    @Published var tool: ToolKind = .pen {
+        didSet { CanvasHub.shared.apply(tool: tool, color: color, width: width) }
+    }
+    @Published var color: UIColor = .black {
+        didSet { CanvasHub.shared.apply(tool: tool, color: color, width: width) }
+    }
+    @Published var width: Double = 4 {
+        didSet { CanvasHub.shared.apply(tool: tool, color: color, width: width) }
+    }
+
+    func undo() { CanvasHub.shared.undo() }
+    func redo() { CanvasHub.shared.redo() }
+}
+
+struct Toolbar: View {
+    @ObservedObject var model: CanvasModel
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ForEach(CanvasModel.ToolKind.allCases, id: \.self) { kind in
+                Button {
+                    model.tool = kind
+                } label: {
+                    Image(systemName: icon(for: kind))
+                        .font(.system(size: 17, weight: .medium))
+                        .frame(width: 34, height: 34)
+                        .background(model.tool == kind ? Color.accentColor.opacity(0.2) : Color.clear)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+                .foregroundStyle(model.tool == kind ? Color.accentColor : Color.primary)
+            }
+            Divider().frame(height: 24)
+            ColorPicker("", selection: Binding(
+                get: { Color(model.color) },
+                set: { model.color = UIColor($0) }
+            )).labelsHidden()
+            Divider().frame(height: 24)
+            Slider(value: $model.width, in: 1...20).frame(width: 100)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(.ultraThinMaterial, in: Capsule())
+        .shadow(color: .black.opacity(0.12), radius: 8, y: 2)
+    }
+
+    private func icon(for kind: CanvasModel.ToolKind) -> String {
+        switch kind {
+        case .pen: return "pencil.tip"
+        case .eraser: return "eraser"
+        case .lasso: return "lasso"
+        }
+    }
+}
+
 struct ContentView: View {
+    @StateObject private var model = CanvasModel()
+
     var body: some View {
         #if os(iOS)
         PencilCanvas()
             .ignoresSafeArea()
             .overlay(alignment: .top) {
-                Text("toolbar?")
-                    .font(.caption)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 8)
-                    .background(.ultraThinMaterial, in: Capsule())
+                Toolbar(model: model)
                     .padding(.top, 10)
             }
         #else
