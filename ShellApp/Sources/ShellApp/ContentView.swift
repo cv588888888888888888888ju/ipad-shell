@@ -15,8 +15,9 @@ private struct HelloMsg: Encodable {
 }
 
 private struct StrokeMsg: Encodable {
-    let type = "stroke"
+    let type: String
     let index: Int
+    let total: Int
     let color: String
     let width: Double
     let pts: [[Double]]
@@ -78,6 +79,16 @@ final class CanvasBridge {
                   let d = try? self.encoder.encode(msg),
                   let line = String(data: d, encoding: .utf8) else { return }
             let payload = (line + "\n").data(using: .utf8) ?? Data()
+            for c in self.conns {
+                c.send(content: payload, completion: .contentProcessed { _ in })
+            }
+        }
+    }
+
+    func reset() {
+        let payload = "{\"type\":\"reset\"}\n".data(using: .utf8) ?? Data()
+        queue.async { [weak self] in
+            guard let self else { return }
             for c in self.conns {
                 c.send(content: payload, completion: .contentProcessed { _ in })
             }
