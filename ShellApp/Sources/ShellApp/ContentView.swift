@@ -66,8 +66,10 @@ final class CanvasBridge {
         }
     }
 
-    func stroke(_ s: PKStroke, index: Int) {
-        let msg = StrokeMsg(index: index,
+    func stroke(_ s: PKStroke, index: Int, update: Bool, total: Int) {
+        let msg = StrokeMsg(type: update ? "update" : "stroke",
+                            index: index,
+                            total: total,
                             color: Self.hex(s.ink.color),
                             width: Self.width(s),
                             pts: Self.points(s))
@@ -130,13 +132,37 @@ final class CanvasBridge {
 final class CanvasCoordinator: NSObject, PKCanvasViewDelegate {
     private var sent = 0
 
+    private var lastPointCount = -1
+    private var lastSend = Date.distantPast
+
     func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
         let strokes = canvasView.drawing.strokes
-        guard strokes.count > sent else { return }
-        for i in sent..<strokes.count {
-            CanvasBridge.shared.stroke(strokes[i], index: i)
+        let now = Date()
+        defer {
+            sent = strokes.count
+            lastPointCount = strokes.last?.path.count ?? -1
         }
-        sent = strokes.count
+
+        if strokes.count < sent {
+            CanvasBridge.shared.reset()
+            for (i, s) in strokes.enumerated() {
+                CanvasBridge.shared.stroke(s, index: i, update: false, total: strokes.count)
+            }
+            return
+        }
+
+        if strokes.count > sent {
+            for i in sent..<strokes.count {
+                CanvasBridge.shared.stroke(strokes[i], index: i, update: false, total: strokes.count)
+            }
+            return
+        }
+
+        guard let last = strokes.last else { return }
+        if last.path.count != lastPointCount, now.timeIntervalSince(lastSend) > 0.05 {
+            CanvasBridge.shared.stroke(last, index: strokes.count - 1, update: true, total: strokes.count)
+            lastSend = now
+        }
     }
 }
 
@@ -168,6 +194,14 @@ struct PencilCanvas: UIViewRepresentable {
                 case "clear": CanvasHub.shared.clear()
                 case "undo": CanvasHub.shared.undo()
                 case "redo": CanvasHub.shared.redo()
+                case "sync":
+                    if let canvas = CanvasHub.shared.canvas {
+                        let strokes = canvas.drawing.strokes
+                        CanvasBridge.shared.reset()
+                        for (i, s) in strokes.enumerated() {
+                            CanvasBridge.shared.stroke(s, index: i, update: false, total: strokes.count)
+                        }
+                    }
                 default: break
                 }
             }

@@ -162,6 +162,14 @@ PAGE = r"""<!doctype html>
   }
 
   var sentFiles = Object.create(null);
+  var expected = 0;
+  var totalKnown = 0;
+
+  function requestSync() {
+    strokes.clear();
+    expected = 0;
+    fetch('/sync', { method: 'POST' }).catch(function () {});
+  }
 
   function pushBackground(dataURL) {
     var img = new Image();
@@ -216,15 +224,28 @@ PAGE = r"""<!doctype html>
   var es = new EventSource('/events');
   es.onopen = function () { hud.textContent = 'connected'; };
   es.onerror = function () { hud.textContent = 'reconnecting…'; };
+  setInterval(function () {
+    if (api && strokes.size !== totalKnown) requestSync();
+  }, 3000);
+
   es.onmessage = function (e) {
     var m;
     try { m = JSON.parse(e.data); } catch (err) { return; }
     if (m.type === 'hello') {
       W = m.w || W; H = m.h || H;
       hud.textContent = 'canvas ' + W + '×' + H;
+      requestSync();
     } else if (m.type === 'reset') {
       strokes.clear();
-    } else if (m.type === 'stroke' || m.type === 'update') {
+      expected = 0;
+    } else if (m.type === 'stroke') {
+      if (typeof m.index === 'number') {
+        if (m.index !== expected) { requestSync(); return; }
+        strokes.set(m.index, m);
+        expected = m.index + 1;
+        if (typeof m.total === 'number') totalKnown = m.total;
+      }
+    } else if (m.type === 'update') {
       if (typeof m.index === 'number') strokes.set(m.index, m);
     } else if (m.type === 'background') {
       setBackground(m);
@@ -245,6 +266,16 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_POST(self) -> None:  # noqa: N802
+        if self.path == "/sync":
+            ok = live_view.send_to_device({"type": "sync"})
+            self.send_response(200 if ok else 503)
+            body = b'{"ok":true}' if ok else b'{"ok":false}'
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         if self.path != "/background":
             self.send_error(404)
             return
