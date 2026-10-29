@@ -30,6 +30,10 @@ final class CanvasBridge {
     private var listener: NWListener?
     private var conns: [NWConnection] = []
     private var canvasSize = CGSize.zero
+    private var hostBuffer = Data()
+
+    /// Messages arriving from the host: commands and page images.
+    var onHostMessage: (([String: Any]) -> Void)?
 
     func configure(size: CGSize) { canvasSize = size }
 
@@ -51,6 +55,7 @@ final class CanvasBridge {
                         c.send(content: (s + "\n").data(using: .utf8) ?? Data(),
                                completion: .contentProcessed { _ in })
                     }
+                    self.receive(on: c)
                 }
                 l.start(queue: self.queue)
                 self.listener = l
@@ -74,6 +79,29 @@ final class CanvasBridge {
             for c in self.conns {
                 c.send(content: payload, completion: .contentProcessed { _ in })
             }
+        }
+    }
+
+    private func receive(on conn: NWConnection) {
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 1_048_576) { [weak self] data, _, isDone, error in
+            guard let self else { return }
+            if let data, !data.isEmpty {
+                self.queue.async { self.consumeHostBytes(data) }
+            }
+            if let error { NSLog("host read error: \(error)"); return }
+            if isDone { return }
+            self.receive(on: conn)
+        }
+    }
+
+    private func consumeHostBytes(_ data: Data) {
+        hostBuffer.append(data)
+        while let nl = hostBuffer.firstIndex(of: 0x0A) {
+            let line = hostBuffer[hostBuffer.startIndex..<nl]
+            hostBuffer = hostBuffer[(nl + 1)...]
+            guard !line.isEmpty,
+                  let json = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else { continue }
+            DispatchQueue.main.async { self.onHostMessage?(json) }
         }
     }
 
@@ -126,6 +154,23 @@ struct PencilCanvas: UIViewRepresentable {
         DispatchQueue.main.async {
             CanvasBridge.shared.configure(size: canvas.bounds.size)
             CanvasBridge.shared.start()
+            CanvasBridge.shared.onHostMessage = { msg in
+                guard let type = msg["type"] as? String else { return }
+                if type == "background" {
+                    if let b64 = msg["data"] as? String,
+                       let data = Data(base64Encoded: b64),
+                       let image = UIImage(data: data) {
+                        CanvasHub.shared.setBackground(image)
+                    }
+                    return
+                }
+                switch type {
+                case "clear": CanvasHub.shared.clear()
+                case "undo": CanvasHub.shared.undo()
+                case "redo": CanvasHub.shared.redo()
+                default: break
+                }
+            }
         }
         return canvas
     }
@@ -156,6 +201,25 @@ final class CanvasHub {
 
     func undo() { canvas?.undoManager?.undo() }
     func redo() { canvas?.undoManager?.redo() }
+    func clear() { canvas?.drawing = PKDrawing() }
+
+    /// Host-supplied page image. The canvas stays opaque, so the page becomes
+    /// its background pattern (one tile at canvas size).
+    func setBackground(_ image: UIImage) {
+        guard let canvas, canvas.bounds.width > 0 else { return }
+        let size = canvas.bounds.size
+        let fmt = UIGraphicsImageRendererFormat.default()
+        fmt.scale = 2
+        let fitted = UIGraphicsImageRenderer(size: size, format: fmt).image { ctx in
+            UIColor.white.setFill()
+            ctx.fill(CGRect(origin: .zero, size: size))
+            let sc = min(size.width / image.size.width, size.height / image.size.height)
+            let dw = image.size.width * sc
+            let dh = image.size.height * sc
+            image.draw(in: CGRect(x: (size.width - dw) / 2, y: (size.height - dh) / 2, width: dw, height: dh))
+        }
+        canvas.backgroundColor = UIColor(patternImage: fitted)
+    }
 }
 
 @MainActor
@@ -174,6 +238,7 @@ final class CanvasModel: ObservableObject {
 
     func undo() { CanvasHub.shared.undo() }
     func redo() { CanvasHub.shared.redo() }
+    func clearDrawing() { CanvasHub.shared.clear() }
 }
 
 struct Toolbar: View {
@@ -200,6 +265,9 @@ struct Toolbar: View {
             )).labelsHidden()
             Divider().frame(height: 24)
             Slider(value: $model.width, in: 1...20).frame(width: 100)
+            Divider().frame(height: 24)
+            Button { model.undo() } label: { Image(systemName: "arrow.uturn.backward") }
+            Button { model.redo() } label: { Image(systemName: "arrow.uturn.forward") }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
