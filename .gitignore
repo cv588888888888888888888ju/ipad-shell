@@ -14,3 +14,8 @@ Payload/
 .DS_Store
 dist/
 .venv/
+
+# 运行态缓存（最后推给 iPad 的页面）
+.last-background.json
+.last-page.json
+__pycache__/

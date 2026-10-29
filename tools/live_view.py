@@ -11,6 +11,7 @@ protocol and the page uses EventSource.
 from __future__ import annotations
 
 import argparse
+import json
 import plistlib
 import socket
 import struct

@@ -85,6 +85,20 @@ final class CanvasBridge {
         }
     }
 
+    func imageRect(id: String, x: Double, y: Double, w: Double, h: Double) {
+        let msg: [String: Any] = ["type": "imageRect", "id": id,
+                                  "x": x, "y": y, "w": w, "h": h]
+        guard let d = try? JSONSerialization.data(withJSONObject: msg),
+              let line = String(data: d, encoding: .utf8) else { return }
+        let payload = (line + "\n").data(using: .utf8) ?? Data()
+        queue.async { [weak self] in
+            guard let self else { return }
+            for c in self.conns {
+                c.send(content: payload, completion: .contentProcessed { _ in })
+            }
+        }
+    }
+
     func reset() {
         let payload = "{\"type\":\"reset\"}\n".data(using: .utf8) ?? Data()
         queue.async { [weak self] in
@@ -140,11 +154,36 @@ final class CanvasBridge {
     }
 }
 
-final class CanvasCoordinator: NSObject, PKCanvasViewDelegate {
+final class CanvasCoordinator: NSObject, PKCanvasViewDelegate, UIGestureRecognizerDelegate {
     private var sent = 0
 
     private var lastPointCount = -1
     private var lastSend = Date.distantPast
+
+    @objc func handleBackgroundPan(_ g: UIPanGestureRecognizer) {
+        guard let view = CanvasHub.shared.activePageView else { return }
+        let t = g.translation(in: g.view)
+        view.center = CGPoint(x: view.center.x + t.x, y: view.center.y + t.y)
+        g.setTranslation(.zero, in: g.view)
+        if g.state == .ended { CanvasHub.shared.reportActiveRect() }
+    }
+
+    @objc func handleBackgroundPinch(_ g: UIPinchGestureRecognizer) {
+        guard let view = CanvasHub.shared.activePageView else { return }
+        let w = view.bounds.width * g.scale
+        let h = view.bounds.height * g.scale
+        g.scale = 1
+        guard w > 20, h > 20, w < 8000, h < 8000 else { return }
+        let center = view.center
+        view.bounds = CGRect(x: 0, y: 0, width: w, height: h)
+        view.center = center
+        if g.state == .ended { CanvasHub.shared.reportActiveRect() }
+    }
+
+    func gestureRecognizer(_ g: UIGestureRecognizer,
+                           shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+        return true
+    }
 
     func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
         let strokes = canvasView.drawing.strokes
@@ -188,16 +227,38 @@ struct PencilCanvas: UIViewRepresentable {
         canvas.isOpaque = true
         canvas.delegate = context.coordinator
         CanvasHub.shared.canvas = canvas
+
+        let pan = UIPanGestureRecognizer(target: context.coordinator,
+                                         action: #selector(CanvasCoordinator.handleBackgroundPan(_:)))
+        pan.minimumNumberOfTouches = 2
+        pan.delegate = context.coordinator
+        canvas.addGestureRecognizer(pan)
+
+        let pinch = UIPinchGestureRecognizer(target: context.coordinator,
+                                             action: #selector(CanvasCoordinator.handleBackgroundPinch(_:)))
+        pinch.delegate = context.coordinator
+        canvas.addGestureRecognizer(pinch)
+
         DispatchQueue.main.async {
             CanvasBridge.shared.configure(size: canvas.bounds.size)
             CanvasBridge.shared.start()
             CanvasBridge.shared.onHostMessage = { msg in
                 guard let type = msg["type"] as? String else { return }
+                if type == "page" {
+                    if let items = msg["images"] as? [[String: Any]] {
+                        CanvasHub.shared.setPage(items)
+                    }
+                    return
+                }
                 if type == "background" {
                     if let b64 = msg["data"] as? String,
                        let data = Data(base64Encoded: b64),
                        let image = UIImage(data: data) {
-                        CanvasHub.shared.setBackground(image)
+                        CanvasHub.shared.setPage([["id": "page", "x": 0, "y": 0,
+                                                   "w": Double(canvas.bounds.width),
+                                                   "h": Double(canvas.bounds.height),
+                                                   "data": b64]])
+                        _ = image
                     }
                     return
                 }
@@ -248,22 +309,57 @@ final class CanvasHub {
     func redo() { canvas?.undoManager?.redo() }
     func clear() { canvas?.drawing = PKDrawing() }
 
-    /// Host-supplied page image. The canvas stays opaque, so the page becomes
-    /// its background pattern (one tile at canvas size).
-    func setBackground(_ image: UIImage) {
-        guard let canvas, canvas.bounds.width > 0 else { return }
-        let size = canvas.bounds.size
-        let fmt = UIGraphicsImageRendererFormat.default()
-        fmt.scale = 2
-        let fitted = UIGraphicsImageRenderer(size: size, format: fmt).image { ctx in
-            UIColor.white.setFill()
-            ctx.fill(CGRect(origin: .zero, size: size))
-            let sc = min(size.width / image.size.width, size.height / image.size.height)
-            let dw = image.size.width * sc
-            let dh = image.size.height * sc
-            image.draw(in: CGRect(x: (size.width - dw) / 2, y: (size.height - dh) / 2, width: dw, height: dh))
+    /// One view per host-side image element, positioned in the same
+    /// coordinate space as the ink so moving an element on either side stays
+    /// visually identical.
+    fileprivate var pageViews: [String: UIImageView] = [:]
+    fileprivate var activeId: String?
+
+    fileprivate var activePageView: UIImageView? {
+        guard let id = activeId else { return nil }
+        return pageViews[id]
+    }
+
+    func setPage(_ items: [[String: Any]]) {
+        guard let canvas else { return }
+        var keep = Set<String>()
+        for item in items {
+            guard let id = item["id"] as? String else { continue }
+            keep.insert(id)
+            var view = pageViews[id]
+            if view == nil {
+                view = UIImageView()
+                view?.contentMode = .scaleAspectFill
+                view?.isUserInteractionEnabled = false
+                if let v = view { canvas.insertSubview(v, at: 0) }
+                pageViews[id] = view
+            }
+            if let b64 = item["data"] as? String, !b64.isEmpty,
+               let data = Data(base64Encoded: b64),
+               let image = UIImage(data: data) {
+                view?.image = image
+            }
+            let x = (item["x"] as? NSNumber)?.doubleValue ?? 0
+            let y = (item["y"] as? NSNumber)?.doubleValue ?? 0
+            let w = (item["w"] as? NSNumber)?.doubleValue ?? 0
+            let h = (item["h"] as? NSNumber)?.doubleValue ?? 0
+            if w > 0, h > 0 {
+                view?.frame = CGRect(x: x, y: y, width: w, height: h)
+            }
         }
-        canvas.backgroundColor = UIColor(patternImage: fitted)
+        for (id, view) in pageViews where !keep.contains(id) {
+            view.removeFromSuperview()
+            pageViews[id] = nil
+        }
+        activeId = (items.last?["id"] as? String) ?? activeId
+    }
+
+    func reportActiveRect() {
+        guard let id = activeId, let view = pageViews[id] else { return }
+        let f = view.frame
+        CanvasBridge.shared.imageRect(id: id,
+                                      x: Double(f.origin.x), y: Double(f.origin.y),
+                                      w: Double(f.size.width), h: Double(f.size.height))
     }
 }
 

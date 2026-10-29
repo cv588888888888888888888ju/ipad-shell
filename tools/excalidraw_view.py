@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import pathlib
 import sys
 import threading
 import time
@@ -21,6 +22,41 @@ from queue import Empty, Queue
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 
 import live_view  # noqa: E402  (usbmuxd helpers + fan-out)
+
+LAST_BG_FILE = pathlib.Path(__file__).resolve().parent.parent / ".last-background.json"
+
+
+def _load_last_background() -> dict | None:
+    try:
+        return json.loads(LAST_BG_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _save_last_background(msg: dict) -> None:
+    try:
+        LAST_BG_FILE.write_text(json.dumps(msg), encoding="utf-8")
+    except Exception as e:
+        print(f"could not persist last background: {e}", file=sys.stderr, flush=True)
+
+
+last_background: dict | None = _load_last_background()
+LAST_PAGE_FILE = pathlib.Path(__file__).resolve().parent.parent / ".last-page.json"
+last_page: dict | None = _load_last_page()
+
+
+def _save_last_page(msg: dict) -> None:
+    try:
+        LAST_PAGE_FILE.write_text(json.dumps(msg), encoding="utf-8")
+    except Exception as e:
+        print(f"could not persist last page: {e}", file=sys.stderr, flush=True)
+
+
+def _load_last_page() -> dict | None:
+    try:
+        return json.loads(LAST_PAGE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
 
 PAGE = r"""<!doctype html>
 <html lang="zh">
@@ -102,18 +138,30 @@ PAGE = r"""<!doctype html>
     };
   }
 
+  var suppress = false;
+
   function schedule() {
     if (pending || !api) return;
     pending = true;
     requestAnimationFrame(function () {
       pending = false;
-      var els = [];
+      if (!api) return;
+      // updateScene replaces the whole scene: keep whatever the user put in
+      // (images, text), and only replace our own stroke layer.
+      var current = [];
+      try { current = api.getSceneElements(); } catch (e) { current = []; }
+      var els = current.filter(function (el) {
+        if (!el || !el.id) return true;
+        return el.id !== 'ipad-background' && String(el.id).indexOf('ipad-stroke-') !== 0;
+      });
       if (bgElement) els.push(bgElement);
       strokes.forEach(function (s, idx) {
         var e = toElement(s, idx);
         if (e) els.push(e);
       });
+      suppress = true;
       try { api.updateScene({ elements: els }); } catch (e) { console.warn(e); }
+      setTimeout(function () { suppress = false; }, 80);
     });
   }
 
@@ -162,6 +210,9 @@ PAGE = r"""<!doctype html>
   }
 
   var sentFiles = Object.create(null);
+  var fileCache = Object.create(null);
+  var pageSig = '';
+  var paintTimer = null;
   var expected = 0;
   var totalKnown = 0;
 
@@ -171,29 +222,101 @@ PAGE = r"""<!doctype html>
     fetch('/sync', { method: 'POST' }).catch(function () {});
   }
 
-  function pushBackground(dataURL) {
-    var img = new Image();
-    img.onload = function () {
-      var c = document.createElement('canvas');
-      c.width = W; c.height = H;
-      var g = c.getContext('2d');
-      g.fillStyle = '#fff';
-      g.fillRect(0, 0, W, H);
-      var sc = Math.min(W / img.width, H / img.height);
-      var dw = img.width * sc, dh = img.height * sc;
-      g.drawImage(img, (W - dw) / 2, (H - dh) / 2, dw, dh);
-      var out = c.toDataURL('image/jpeg', 0.85);
-      var b64 = out.split(',')[1];
-      hud.textContent = 'pushing page to ipad…';
-      fetch('/background', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'background', mime: 'image/jpeg', w: W, h: H, data: b64 })
-      }).then(function (r) {
-        hud.textContent = r.ok ? 'page sent to ipad' : 'ipad not attached';
-      }).catch(function () { hud.textContent = 'push failed'; });
-    };
-    img.src = dataURL;
+  // Send the image elements as-is: the iPad lays out one view per element, so
+  // it can be moved on either side and stay identical.
+  function pushPage() {
+    var els;
+    try { els = api.getSceneElements(); } catch (e) { return; }
+    var imgs = els.filter(function (el) {
+      return el && el.type === 'image' && el.fileId && !el.isDeleted;
+    });
+    var items = [];
+    imgs.forEach(function (el) {
+      var src = fileCache[el.fileId] || '';
+      var b64 = String(src).split(',')[1] || '';
+      if (!b64) return;
+      items.push({ id: el.id, x: el.x, y: el.y, w: el.width, h: el.height, data: b64 });
+    });
+    if (!items.length) return;
+    hud.textContent = 'pushing page to ipad…';
+    fetch('/page', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'page', images: items })
+    }).then(function (r) {
+      hud.textContent = r.ok ? 'page sent to ipad' : 'ipad not attached';
+    }).catch(function () { hud.textContent = 'push failed'; });
+  }
+
+  function schedulePaint() {
+    if (paintTimer) clearTimeout(paintTimer);
+    paintTimer = setTimeout(function () {
+      var sig = '';
+      try {
+        api.getSceneElements().forEach(function (el) {
+          if (!el || String(el.id).indexOf('ipad-stroke-') === 0) return;
+          sig += el.id + ':' + Math.round(el.x) + ',' + Math.round(el.y) + ',' +
+                 Math.round(el.width) + ',' + Math.round(el.height) + ';';
+        });
+      } catch (e) { return; }
+      if (sig === pageSig) return;
+      pageSig = sig;
+      pushPage();
+    }, 400);
+  }
+
+  // An image element was dragged/pinched on the iPad: adopt its new rect here
+  // so both sides agree without a round trip back to the device.
+  function applyImageRect(m) {
+    var els;
+    try { els = api.getSceneElements(); } catch (e) { return; }
+    var hit = false;
+    var next = els.map(function (el) {
+      if (el.id !== m.id) return el;
+      hit = true;
+      var copy = Object.assign({}, el);
+      copy.x = m.x;
+      copy.y = m.y;
+      copy.width = m.w;
+      copy.height = m.h;
+      copy.version = (el.version || 1) + 1;
+      copy.versionNonce = Math.floor(Math.random() * 2 ** 31);
+      copy.updated = Date.now();
+      return copy;
+    });
+    if (!hit) return;
+    suppress = true;
+    try { api.updateScene({ elements: next }); } catch (e) { console.warn(e); }
+    setTimeout(function () { suppress = false; }, 120);
+    hud.textContent = 'image moved on ipad';
+    schedule();
+  }
+
+  function restorePage() {
+    fetch('/last-page').then(function (r) { return r.json(); }).then(function (m) {
+      if (!m || !m.images || !m.images.length || !api) return;
+      var elements = [];
+      m.images.forEach(function (it, i) {
+        var fileId = 'restored-' + i;
+        var dataURL = 'data:image/jpeg;base64,' + it.data;
+        try {
+          api.addFiles([{ id: fileId, mimeType: 'image/jpeg', dataURL: dataURL, created: Date.now() }]);
+        } catch (e) { console.warn(e); }
+        elements.push({
+          id: it.id || ('restored-' + i), type: 'image',
+          x: it.x, y: it.y, width: it.w, height: it.h,
+          angle: 0, strokeColor: 'transparent', backgroundColor: 'transparent',
+          fillStyle: 'solid', strokeWidth: 1, strokeStyle: 'solid', roughness: 0,
+          opacity: 100, groupIds: [], frameId: null, roundness: null, seed: 2,
+          version: 1, versionNonce: 2, isDeleted: false, boundElements: null,
+          updated: Date.now(), link: null, locked: true, fileId: fileId,
+          status: 'saved', scale: [1, 1]
+        });
+      });
+      suppress = true;
+      try { api.updateScene({ elements: elements }); } catch (e) { console.warn(e); }
+      setTimeout(function () { suppress = false; }, 100);
+    }).catch(function () {});
   }
 
   function App() {
@@ -203,17 +326,38 @@ PAGE = r"""<!doctype html>
         hud.textContent = 'excalidraw ready';
         if (bgElement) api.addFiles([bgFile]);
         schedule();
+        restorePage();
       },
       onChange: function (elements, appState, files) {
-        if (!files) return;
+        if (files) {
+          for (var k in files) {
+            if (files[k] && files[k].dataURL) fileCache[k] = files[k].dataURL;
+          }
+        }
+        if (suppress) return;
+
+        // Snap each newly inserted image onto the shared page rectangle
+        // (0,0,W,H). This is the only region both screens agree on.
+        var changed = false;
         for (var i = 0; i < elements.length; i++) {
           var el = elements[i];
-          if (el.type !== 'image' || !el.fileId || el.isDeleted) continue;
-          var f = files[el.fileId];
-          if (!f || !f.dataURL || sentFiles[el.fileId]) continue;
+          if (!el || el.type !== 'image' || !el.fileId || el.isDeleted) continue;
+          if (sentFiles[el.fileId]) continue;
           sentFiles[el.fileId] = true;
-          pushBackground(f.dataURL);
+          var sc = Math.min(W / el.width, H / el.height);
+          el.x = (W - el.width * sc) / 2;
+          el.y = (H - el.height * sc) / 2;
+          el.width = el.width * sc;
+          el.height = el.height * sc;
+          changed = true;
         }
+        if (changed) {
+          suppress = true;
+          try { api.updateScene({ elements: elements }); } catch (e) { console.warn(e); }
+          setTimeout(function () { suppress = false; }, 80);
+        }
+
+        schedulePaint();
       },
       initialData: { appState: { viewBackgroundColor: '#ffffff' } }
     });
@@ -249,6 +393,9 @@ PAGE = r"""<!doctype html>
       if (typeof m.index === 'number') strokes.set(m.index, m);
     } else if (m.type === 'background') {
       setBackground(m);
+    } else if (m.type === 'imageRect') {
+      applyImageRect(m);
+      return;
     }
     schedule();
   };
@@ -276,6 +423,36 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
+        if self.path == "/page":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self.send_error(400)
+                return
+            raw = self.rfile.read(length)
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                self.send_error(400)
+                return
+            if msg.get("type") != "page" or not isinstance(msg.get("images"), list):
+                self.send_error(400)
+                return
+            global last_page
+            last_page = msg
+            _save_last_page(msg)
+            total = sum(len(i.get("data", "")) for i in msg["images"] if isinstance(i, dict))
+            print(f"page push: {len(msg['images'])} image(s), {total} b64 chars -> device",
+                  file=sys.stderr, flush=True)
+            ok = live_view.send_to_device(msg)
+            self.send_response(200 if ok else 503)
+            self.send_header("Content-Type", "application/json")
+            body = b'{"ok":true}' if ok else b'{"ok":false}'
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         if self.path != "/background":
             self.send_error(404)
             return
@@ -293,6 +470,10 @@ class Handler(BaseHTTPRequestHandler):
         if msg.get("type") != "background" or not isinstance(msg.get("data"), str):
             self.send_error(400)
             return
+        global last_background
+        last_background = msg
+        _save_last_background(msg)
+        print(f"background push: {len(msg.get('data', ''))} b64 chars -> device", file=sys.stderr, flush=True)
         ok = live_view.send_to_device(msg)
         self.send_response(200 if ok else 503)
         self.send_header("Content-Type", "application/json")
@@ -302,6 +483,24 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/last-page":
+            body = json.dumps(last_page or {}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if self.path == "/last-background":
+            body = json.dumps(last_background or {}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         if self.path == "/":
             body = PAGE.encode("utf-8")
             self.send_response(200)
